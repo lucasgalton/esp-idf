@@ -113,7 +113,7 @@ menu "Ethernet"
 
         config ETH_IRAM_OPTIMIZATION
             bool "Enable IRAM optimization"
-            default y
+            default n
             help
                 If enabled, functions related to RX/TX are placed into IRAM. It can improve Ethernet throughput.
                 If disabled, all functions are placed into FLASH.
