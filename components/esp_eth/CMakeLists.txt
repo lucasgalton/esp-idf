@@ -22,7 +22,6 @@ if (CONFIG_ETH_ENABLED)
         endif ()
     endif ()
 
-    if (CONFIG_ETH_USE_ESP32_EMAC)
         list(APPEND srcs "src/esp_eth_mac_esp.c"
                 "src/esp_eth_phy_dp83848.c"
                 "src/esp_eth_phy_ip101.c"
@@ -33,7 +32,6 @@ if (CONFIG_ETH_ENABLED)
                 "src/ksz8863_ctrl.c"
                 "src/esp_eth_phy_ksz8863.c"
                 "src/esp_eth_pmac_ksz8863.c")
-    endif ()
 
 endif ()
 
