@@ -17,6 +17,7 @@ if(CONFIG_ETH_ENABLED)
         # esp_netif related
         if(esp_netif IN_LIST components_to_build)
             list(APPEND srcs "src/esp_eth_netif_glue.c")
+            list(APPEND priv_requires esp_netif esp_pm)
         endif()
     endif()
 
@@ -56,11 +57,4 @@ idf_component_register(SRCS "${srcs}"
                        PRIV_REQUIRES ${priv_requires})
 if(CONFIG_ETH_ENABLED)
     target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-format")
-endif()
-
-if(CONFIG_ETH_ENABLED)
-    if(CONFIG_ETH_USE_SPI_ETHERNET)
-        idf_component_optional_requires(PUBLIC driver)
-    endif()
-    idf_component_optional_requires(PRIVATE esp_netif esp_pm)
 endif()
