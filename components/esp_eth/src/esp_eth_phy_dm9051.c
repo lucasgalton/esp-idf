@@ -51,7 +51,7 @@ typedef union {
         uint32_t phy_addr : 5; /* PHY Address */
         uint32_t reserved : 3; /* Reserved */
         uint32_t hdx10 : 1;    /* 10M Half-Duplex Operation Mode */
-        uint32_t fdx10 : 1;    /* 10M Full-Duplex Operation Mode */
+        uint32_t fdx10 : 1;    /* 10M Full-Duple`x Operation Mode */
         uint32_t hdx100 : 1;   /* 100M Half-Duplex Operation Mode */
         uint32_t fdx100 : 1;   /* 100M Full-Duplex Operation Mode */
     };
