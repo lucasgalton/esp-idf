@@ -424,7 +424,6 @@ typedef struct {
         .flags = 0,                                       \
     }
 
-#if CONFIG_ETH_USE_ESP32_EMAC
 /**
 * @brief EMAC specific configuration
 *
@@ -468,7 +467,6 @@ typedef struct {
 *      - NULL: create MAC instance failed because some error occurred
 */
 esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_esp32_emac_config_t *esp32_config, const eth_mac_config_t *config);
-#endif // CONFIG_ETH_USE_ESP32_EMAC
 
 #if CONFIG_ETH_USE_SPI_ETHERNET
 /**
