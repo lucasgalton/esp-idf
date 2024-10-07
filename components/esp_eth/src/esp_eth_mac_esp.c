@@ -6,25 +6,26 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/cdefs.h>
+#include <stdarg.h>
 #include "driver/periph_ctrl.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_check.h"
-#include "esp_eth.h"
+#include "esp_eth_driver.h"
 #include "esp_pm.h"
-#include "esp_system.h"
+#include "esp_mac.h"
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_intr_alloc.h"
 #include "esp_private/esp_clk.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "hal/cpu_hal.h"
 #include "hal/emac_hal.h"
 #include "hal/gpio_hal.h"
 #include "soc/soc.h"
-#include "soc/rtc.h"
+#include "clk_ctrl_os.h"
 #include "sdkconfig.h"
 #include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
@@ -33,7 +34,7 @@
 static const char *TAG = "esp.emac";
 
 #define PHY_OPERATION_TIMEOUT_US (1000)
-#define MAC_STOP_TIMEOUT_US (250)
+#define MAC_STOP_TIMEOUT_US (2500) // this is absolute maximum for 10Mbps, it is 10 times faster for 100Mbps
 #define FLOW_CONTROL_LOW_WATER_MARK (CONFIG_ETH_DMA_RX_BUFFER_NUM / 3)
 #define FLOW_CONTROL_HIGH_WATER_MARK (FLOW_CONTROL_LOW_WATER_MARK * 2)
 
@@ -57,9 +58,11 @@ typedef struct {
     bool isr_need_yield;
     bool flow_ctrl_enabled; // indicates whether the user want to do flow control
     bool do_flow_ctrl;  // indicates whether we need to do software flow control
+    bool use_apll;  // Only use APLL in EMAC_DATA_INTERFACE_RMII && EMAC_CLK_OUT
 #ifdef CONFIG_PM_ENABLE
     esp_pm_lock_handle_t pm_lock;
 #endif
+    eth_mac_dma_burst_len_t dma_burst_len;
 } emac_esp32_t;
 
 static esp_err_t esp_emac_alloc_driver_obj(const eth_mac_config_t *config, emac_esp32_t **emac_out_hdl, void **out_descriptors);
@@ -153,10 +156,12 @@ static esp_err_t emac_esp32_set_link(esp_eth_mac_t *mac, eth_link_t link)
     case ETH_LINK_UP:
         ESP_GOTO_ON_ERROR(esp_intr_enable(emac->intr_hdl), err, TAG, "enable interrupt failed");
         emac_esp32_start(mac);
+        ESP_LOGD(TAG, "emac started");
         break;
     case ETH_LINK_DOWN:
         ESP_GOTO_ON_ERROR(esp_intr_disable(emac->intr_hdl), err, TAG, "disable interrupt failed");
         emac_esp32_stop(mac);
+        ESP_LOGD(TAG, "emac stopped");
         break;
     default:
         ESP_GOTO_ON_FALSE(false, ESP_ERR_INVALID_ARG, err, TAG, "unknown link status");
@@ -232,6 +237,25 @@ err:
     return ret;
 }
 
+static esp_err_t emac_esp32_transmit_multiple_bufs(esp_eth_mac_t *mac, uint32_t argc, va_list args)
+{
+    esp_err_t ret = ESP_OK;
+    emac_esp32_t *emac = __containerof(mac, emac_esp32_t, parent);
+    uint8_t *bufs[argc];
+    uint32_t len[argc];
+    uint32_t exp_len = 0;
+    for (int i = 0; i < argc; i++) {
+        bufs[i] = va_arg(args, uint8_t*);
+        len[i] = va_arg(args, uint32_t);
+        exp_len += len[i];
+    }
+    uint32_t sent_len = emac_hal_transmit_multiple_buf_frame(&emac->hal, bufs, len, argc);
+    ESP_GOTO_ON_FALSE(sent_len == exp_len, ESP_ERR_INVALID_SIZE, err, TAG, "insufficient TX buffer size");
+    return ESP_OK;
+err:
+    return ret;
+}
+
 static esp_err_t emac_esp32_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *length)
 {
     esp_err_t ret = ESP_OK;
@@ -240,7 +264,6 @@ static esp_err_t emac_esp32_receive(esp_eth_mac_t *mac, uint8_t *buf, uint32_t *
     ESP_GOTO_ON_FALSE(buf && length, ESP_ERR_INVALID_ARG, err, TAG, "can't set buf and length to null");
     uint32_t receive_len = emac_hal_receive_frame(&emac->hal, buf, expected_len, &emac->frames_remain, &emac->free_rx_descriptor);
     /* we need to check the return value in case the buffer size is not enough */
-    ESP_LOGD(TAG, "receive len= %d", receive_len);
     ESP_GOTO_ON_FALSE(expected_len >= receive_len, ESP_ERR_INVALID_SIZE, err, TAG, "received buffer longer than expected");
     *length = receive_len;
     return ESP_OK;
@@ -253,24 +276,33 @@ static void emac_esp32_rx_task(void *arg)
 {
     emac_esp32_t *emac = (emac_esp32_t *)arg;
     uint8_t *buffer = NULL;
-    uint32_t length = 0;
     while (1) {
         // block indefinitely until got notification from underlay event
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         do {
-            length = ETH_MAX_PACKET_SIZE;
-            buffer = malloc(length);
-            if (!buffer) {
-                ESP_LOGE(TAG, "no mem for receive buffer");
-            } else if (emac_esp32_receive(&emac->parent, buffer, &length) == ESP_OK) {
-                /* pass the buffer to stack (e.g. TCP/IP layer) */
-                if (length) {
-                    emac->eth->stack_input(emac->eth, buffer, length);
-                } else {
+            /* set max expected frame len */
+            uint32_t frame_len = ETH_MAX_PACKET_SIZE;
+            buffer = emac_hal_alloc_recv_buf(&emac->hal, &frame_len);
+            /* we have memory to receive the frame of maximal size previously defined */
+            if (buffer != NULL) {
+                uint32_t recv_len = emac_hal_receive_frame(&emac->hal, buffer, EMAC_HAL_BUF_SIZE_AUTO, &emac->frames_remain, &emac->free_rx_descriptor);
+                if (recv_len == 0) {
+                    ESP_LOGE(TAG, "frame copy error");
                     free(buffer);
+                    /* ensure that interface to EMAC does not get stuck with unprocessed frames */
+                    emac_hal_flush_recv_frame(&emac->hal, &emac->frames_remain, &emac->free_rx_descriptor);
+                } else if (frame_len > recv_len) {
+                    ESP_LOGE(TAG, "received frame was truncated");
+                    free(buffer);
+                } else {
+                    ESP_LOGD(TAG, "receive len= %d", recv_len);
+                    emac->eth->stack_input(emac->eth, buffer, recv_len);
                 }
-            } else {
-                free(buffer);
+            /* if allocation failed and there is a waiting frame */
+            } else if (frame_len) {
+                ESP_LOGE(TAG, "no mem for receive buffer");
+                /* ensure that interface to EMAC does not get stuck with unprocessed frames */
+                emac_hal_flush_recv_frame(&emac->hal, &emac->frames_remain, &emac->free_rx_descriptor);
             }
 #if CONFIG_ETH_SOFT_FLOW_CONTROL
             // we need to do extra checking of remained frames in case there are no unhandled frames left, but pause frame is still undergoing
@@ -302,8 +334,9 @@ static void emac_esp32_init_smi_gpio(emac_esp32_t *emac)
     }
 }
 
-static void emac_config_apll_clock(void)
+static esp_err_t emac_config_apll_clock(void)
 {
+
     /* apll_freq = xtal_freq * (4 + sdm2 + sdm1/256 + sdm0/65536)/((o_div + 2) * 2) */
     rtc_xtal_freq_t rtc_xtal_freq = rtc_clk_xtal_freq_get();
     switch (rtc_xtal_freq) {
@@ -326,6 +359,8 @@ static void emac_config_apll_clock(void)
         rtc_clk_apll_enable(true, 0, 0, 6, 2);
         break;
     }
+
+    return ESP_OK;
 }
 
 static esp_err_t emac_esp32_init(esp_eth_mac_t *mac)
@@ -349,12 +384,11 @@ static esp_err_t emac_esp32_init(esp_eth_mac_t *mac)
     ESP_GOTO_ON_FALSE(to < emac->sw_reset_timeout_ms / 10, ESP_ERR_TIMEOUT, err, TAG, "reset timeout");
     /* set smi clock */
     emac_hal_set_csr_clock_range(&emac->hal, esp_clk_apb_freq());
-    /* reset descriptor chain */
-    emac_hal_reset_desc_chain(&emac->hal);
     /* init mac registers by default */
     emac_hal_init_mac_default(&emac->hal);
-    /* init dma registers by default */
-    emac_hal_init_dma_default(&emac->hal);
+    /* init dma registers with selected EMAC-DMA configuration */
+    emac_hal_dma_config_t dma_config = { .dma_burst_len = emac->dma_burst_len };
+    emac_hal_init_dma_default(&emac->hal, &dma_config);
     /* get emac address from efuse */
     ESP_GOTO_ON_ERROR(esp_read_mac(emac->addr, ESP_MAC_ETH), err, TAG, "fetch ethernet mac address failed");
     /* set MAC address to emac register */
@@ -384,6 +418,7 @@ static esp_err_t emac_esp32_deinit(esp_eth_mac_t *mac)
 static esp_err_t emac_esp32_start(esp_eth_mac_t *mac)
 {
     emac_esp32_t *emac = __containerof(mac, emac_esp32_t, parent);
+    /* reset descriptor chain */
     emac_hal_reset_desc_chain(&emac->hal);
     emac_hal_start(&emac->hal);
     return ESP_OK;
@@ -440,6 +475,9 @@ static void esp_emac_free_driver_obj(emac_esp32_t *emac, void *descriptors)
         }
         if (emac->intr_hdl) {
             esp_intr_free(emac->intr_hdl);
+        }
+        if (emac->use_apll) {
+            //FIXME periph_rtc_apll_release();
         }
         for (int i = 0; i < CONFIG_ETH_DMA_TX_BUFFER_NUM; i++) {
             free(emac->tx_buf[i]);
@@ -505,12 +543,12 @@ err:
     return ret;
 }
 
-static esp_err_t esp_emac_config_data_interface(const eth_mac_config_t *config, emac_esp32_t *emac)
+static esp_err_t esp_emac_config_data_interface(const eth_esp32_emac_config_t *esp32_emac_config, emac_esp32_t *emac)
 {
     esp_err_t ret = ESP_OK;
-    switch (config->interface) {
+    switch (esp32_emac_config->interface) {
     case EMAC_DATA_INTERFACE_MII:
-        emac->clock_config = config->clock_config;
+        emac->clock_config = esp32_emac_config->clock_config;
         /* MII interface GPIO initialization */
         emac_hal_iomux_init_mii();
         /* Enable MII clock */
@@ -518,7 +556,7 @@ static esp_err_t esp_emac_config_data_interface(const eth_mac_config_t *config, 
         break;
     case EMAC_DATA_INTERFACE_RMII:
         // by default, the clock mode is selected at compile time (by Kconfig)
-        if (config->clock_config.rmii.clock_mode == EMAC_CLK_DEFAULT) {
+        if (esp32_emac_config->clock_config.rmii.clock_mode == EMAC_CLK_DEFAULT) {
 #if CONFIG_ETH_RMII_CLK_INPUT
 #if CONFIG_ETH_RMII_CLK_IN_GPIO == 0
             emac->clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
@@ -537,7 +575,7 @@ static esp_err_t esp_emac_config_data_interface(const eth_mac_config_t *config, 
 #error "Unsupported RMII clock mode"
 #endif
         } else {
-            emac->clock_config = config->clock_config;
+            emac->clock_config = esp32_emac_config->clock_config;
         }
         /* RMII interface GPIO initialization */
         emac_hal_iomux_init_rmii();
@@ -558,19 +596,22 @@ static esp_err_t esp_emac_config_data_interface(const eth_mac_config_t *config, 
             }
             /* Enable RMII clock */
             emac_ll_clock_enable_rmii_output(emac->hal.ext_regs);
-            emac_config_apll_clock();
+            // Power up APLL clock
+            //FIXME periph_rtc_apll_acquire();
+            ESP_GOTO_ON_ERROR(emac_config_apll_clock(), err, TAG, "Configure APLL for RMII failed");
+            emac->use_apll = true;
         } else {
             ESP_GOTO_ON_FALSE(false, ESP_ERR_INVALID_ARG, err, TAG, "invalid EMAC clock mode");
         }
         break;
     default:
-        ESP_GOTO_ON_FALSE(false, ESP_ERR_INVALID_ARG, err, TAG, "invalid EMAC Data Interface:%d", config->interface);
+        ESP_GOTO_ON_FALSE(false, ESP_ERR_INVALID_ARG, err, TAG, "invalid EMAC Data Interface:%d", esp32_emac_config->interface);
     }
 err:
     return ret;
 }
 
-esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_mac_config_t *config)
+esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_esp32_emac_config_t *esp32_config, const eth_mac_config_t *config)
 {
     esp_err_t ret_code = ESP_OK;
     esp_eth_mac_t *ret = NULL;
@@ -593,12 +634,13 @@ esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_mac_config_t *config)
                                   emac_isr_default_handler, &emac->hal, &(emac->intr_hdl));
     }
     ESP_GOTO_ON_FALSE(ret_code == ESP_OK, NULL, err, TAG, "alloc emac interrupt failed");
-    ret_code = esp_emac_config_data_interface(config, emac);
+    ret_code = esp_emac_config_data_interface(esp32_config, emac);
     ESP_GOTO_ON_FALSE(ret_code == ESP_OK, NULL, err_interf, TAG, "config emac interface failed");
 
+    emac->dma_burst_len = esp32_config->dma_burst_len;
     emac->sw_reset_timeout_ms = config->sw_reset_timeout_ms;
-    emac->smi_mdc_gpio_num = config->smi_mdc_gpio_num;
-    emac->smi_mdio_gpio_num = config->smi_mdio_gpio_num;
+    emac->smi_mdc_gpio_num = esp32_config->smi_mdc_gpio_num;
+    emac->smi_mdio_gpio_num = esp32_config->smi_mdio_gpio_num;
     emac->flow_control_high_water_mark = FLOW_CONTROL_HIGH_WATER_MARK;
     emac->flow_control_low_water_mark = FLOW_CONTROL_LOW_WATER_MARK;
     emac->parent.set_mediator = emac_esp32_set_mediator;
@@ -618,6 +660,7 @@ esp_eth_mac_t *esp_eth_mac_new_esp32(const eth_mac_config_t *config)
     emac->parent.set_peer_pause_ability = emac_esp32_set_peer_pause_ability;
     emac->parent.enable_flow_ctrl = emac_esp32_enable_flow_ctrl;
     emac->parent.transmit = emac_esp32_transmit;
+    emac->parent.transmit_vargs = emac_esp32_transmit_multiple_bufs;
     emac->parent.receive = emac_esp32_receive;
     return &(emac->parent);
 
