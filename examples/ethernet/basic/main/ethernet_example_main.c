@@ -237,7 +237,7 @@ void app_main(void)
 
         ESP_ERROR_CHECK(spi_bus_add_device(CONFIG_EXAMPLE_ETH_SPI_HOST, &devcfg, &spi_handle[i]));
         // w5500 ethernet driver is based on spi driver
-        eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(spi_handle[i]);
+        eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(CONFIG_EXAMPLE_ETH_SPI_HOST, &devcfg);
 
         // Set remaining GPIO numbers and configuration used by the SPI module
         w5500_config.int_gpio_num = spi_eth_module_config[i].int_gpio;

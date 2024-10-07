@@ -81,7 +81,7 @@ static void eth_action_start(void *handler_args, esp_event_base_t base, int32_t 
         eth_speed_t speed;
         esp_eth_ioctl(eth_handle, ETH_CMD_G_SPEED, &speed);
         esp_netif_action_start(netif_glue->base.netif, base, event_id, event_data);
-        esp_netif_set_link_speed(netif_glue->base.netif, speed == ETH_SPEED_100M ? 100000000 : 10000000);
+        //esp_netif_set_link_speed(netif_glue->base.netif, speed == ETH_SPEED_100M ? 100000000 : 10000000);
     }
 }
 
