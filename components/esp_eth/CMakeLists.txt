@@ -9,7 +9,6 @@ set(ld_fragments linker.lf)
 set(priv_requires driver log esp_timer)
 
 # If Ethernet disabled in Kconfig, this is a config-only component
-if (CONFIG_ETH_ENABLED)
     set(srcs "src/esp_eth.c" "src/esp_eth_phy_802_3.c")
     set(include "include")
 
@@ -33,13 +32,10 @@ if (CONFIG_ETH_ENABLED)
                 "src/esp_eth_phy_ksz8863.c"
                 "src/esp_eth_pmac_ksz8863.c")
 
-endif ()
 
 idf_component_register(SRCS "${srcs}"
         INCLUDE_DIRS ${include}
         LDFRAGMENTS ${ld_fragments}
         REQUIRES esp_event # For using "ESP_EVENT_DECLARE_BASE" in header file
         PRIV_REQUIRES ${priv_requires})
-if (CONFIG_ETH_ENABLED)
     target_compile_options(${COMPONENT_LIB} PRIVATE "-Wno-format")
-endif ()
